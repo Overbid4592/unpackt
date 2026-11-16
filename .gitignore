@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+env/
+
+# Results of Unpackt – never upload your own data!
+# Ergebnisse von Unpackt – nie die eigenen Daten hochladen!
+entpackt_*/
+_arbeitsordner/
+
+# Archives (e.g. your ChatGPT export) – never upload!
+# Archive (z. B. dein ChatGPT-Export) – nie hochladen!
+*.zip
+*.7z
+*.rar
+*.tar
+*.tgz
+*.gz
+*.bz2
+*.tbz2
+*.xz
+*.txz
+*.zst
+*.lzma
+*.iso
+*.cab
+
+# System / Editor
+Thumbs.db
+desktop.ini
+.DS_Store
+.vscode/
+.idea/
+
+# Build (PyInstaller) – the EXE goes to GitHub Releases, not into the repo
+# Bauen (PyInstaller) – die EXE kommt zu GitHub Releases, nicht ins Repo
+build/
+dist/
+*.spec
+.venv-build/
+
+# Certificates / keys – never upload!
+# Zertifikate / Schlüssel – nie hochladen!
+*.pfx
+*.p12
+*.cer
+*.pvk
+
+# Upload copy / Kopie zum Hochladen
+githochunpackt/
