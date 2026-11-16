@@ -4,5 +4,5 @@
 *.png binary
 *.jpg binary
 
-# Windows batch files need CRLF
-*.bat text eol=crlf
+# Windows batch files: keep exactly as stored (CRLF), no conversion
+*.bat -text
