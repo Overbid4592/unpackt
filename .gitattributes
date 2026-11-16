@@ -1,0 +1,8 @@
+# Text files with LF line endings in the repository
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+
+# Windows batch files need CRLF
+*.bat text eol=crlf
