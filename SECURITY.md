@@ -8,7 +8,8 @@
 
 | Version | Supported |
 |---|---|
-| 1.0.x | ✅ |
+| 1.1.x | ✅ |
+| 1.0.x | ❌ please update / bitte aktualisieren |
 
 ### Reporting a vulnerability
 
@@ -31,8 +32,11 @@ This is a small hobby project. We will answer as soon as we can.
 - Paths that try to leave the target folder are refused.
 - Files from an archive are never opened or started.
 - The target folder must be new or empty – nothing is overwritten.
-
-Known limit: very large "decompression bomb" archives are not limited yet.
+- Protection against decompression bombs (since 1.1.0): the unpacked size and the free disk space
+  are checked before unpacking (5 GB always stay free), suspicious archives need a confirmation,
+  and a guard stops archives that write more than they announce.
+- Virus scanner layer (since 1.1.0): every file goes into a quarantine first and is checked by the
+  active virus scanner (real-time protection + AMSI). Blocked files are never sorted in.
 
 ## Deutsch
 
@@ -40,7 +44,8 @@ Known limit: very large "decompression bomb" archives are not limited yet.
 
 | Version | Unterstützt |
 |---|---|
-| 1.0.x | ✅ |
+| 1.1.x | ✅ |
+| 1.0.x | ❌ please update / bitte aktualisieren |
 
 ### Eine Sicherheitslücke melden
 
@@ -63,5 +68,8 @@ Das ist ein kleines Hobby-Projekt. Wir antworten, so schnell wir können.
 - Pfade, die aus dem Ziel-Ordner ausbrechen wollen, werden abgelehnt.
 - Dateien aus einem Archiv werden nie geöffnet oder gestartet.
 - Der Ziel-Ordner muss neu oder leer sein – es wird nichts überschrieben.
-
-Bekannte Grenze: Sehr große „Entpack-Bomben“ (decompression bombs) werden noch nicht begrenzt.
+- Schutz vor Entpack-Bomben (seit 1.1.0): Vor dem Auspacken werden die ausgepackte Größe und der
+  freie Platz geprüft (5 GB bleiben immer frei), verdächtige Archive brauchen eine Bestätigung,
+  und ein Wächter stoppt Archive, die mehr schreiben, als sie angeben.
+- Virenscanner-Schicht (seit 1.1.0): Jede Datei kommt zuerst in eine Quarantäne und wird vom aktiven
+  Virenscanner geprüft (Echtzeitschutz + AMSI). Blockierte Dateien werden nie einsortiert.

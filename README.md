@@ -62,6 +62,23 @@ Every single file is checked afterwards.
   3. SHA-256 of the archive **after** unpacking – it must be identical
   4. Results in `Zuordnung.csv` (every file with its SHA-256) and `SHA256.txt`
 
+- **Protection against decompression bombs** (tiny archive, gigantic content)
+  - Before unpacking: estimates the unpacked size and checks the free disk space
+    (5 GB always stay free). Suspicious archives (more than 100× bigger and over 1 GB,
+    or more than 1,000,000 files) → Unpackt **asks first**; "No" is the default.
+  - While unpacking: a guard counts what is really written. An archive that lies about
+    its size, or a full disk, stops everything cleanly.
+  - Archives inside the archive are never unpacked further, so "42.zip"-style bombs do nothing.
+
+- **Virus scanner layer – works with any virus scanner** (Bitdefender, Defender, Kaspersky …)
+  - Unpackt asks Windows which scanner is active and writes it into the log.
+  - Every file goes into a **quarantine** first (a work folder inside the target).
+  - Each file is read for the check – the active real-time protection looks at it –
+    and Unpackt also asks the scanner directly via **AMSI** (the scan interface of Windows).
+  - Files the scanner blocks or removes are **not** sorted in; they are listed in red
+    and in `Zuordnung.csv` (`pruefung` = `VIRUS`). Nothing from the archive is ever started.
+  - Costs some time: 40,000 files took 183 s instead of 103 s in our test.
+
 - **ChatGPT exports** are detected automatically. Files get their real names back
   (instead of `file_….dat`), and every chat is written as Markdown into `Chats/`
   with links to the sorted files.
@@ -117,8 +134,12 @@ python unpackt.py export.7z D:\Sorted\Export # own target folder
 | `--abschnitt N` | files per section before checking (default 2000) |
 | `--probe` | dry run: only count, write nothing (ZIP or folder) |
 | `--hardlink` | hard links instead of copies (folder source, same drive) |
+| `--gross` | also unpack suspiciously big archives without asking (disk space protection stays on) |
 | `--gui` | open the window |
 | `--version` | show the version |
+
+Exit codes: `0` done · `1` done with errors · `2` could not start · `3` cancelled ·
+`4` stopped by the bomb protection · `5` done, but the virus scanner blocked files.
 
 ### Result
 
@@ -208,6 +229,23 @@ Danach wird jede einzelne Datei geprüft.
   3. SHA-256 des Archivs **nachher** – muss gleich sein
   4. Ergebnisse in `Zuordnung.csv` (jede Datei mit SHA-256) und `SHA256.txt`
 
+- **Schutz vor Entpack-Bomben** (winziges Archiv, riesiger Inhalt)
+  - Vorher: schätzt die ausgepackte Größe und prüft den freien Platz
+    (5 GB bleiben immer frei). Verdächtige Archive (mehr als 100-mal größer und über 1 GB,
+    oder mehr als 1.000.000 Dateien) → Unpackt **fragt nach**; „Nein“ ist vorausgewählt.
+  - Während des Auspackens: Ein Wächter zählt mit, was wirklich geschrieben wird. Ein Archiv,
+    das über seine Größe lügt, oder eine volle Festplatte stoppt alles sauber.
+  - Archive im Archiv werden nie weiter ausgepackt – Bomben wie „42.zip“ bewirken nichts.
+
+- **Virenscanner-Schicht – mit jedem Virenscanner** (Bitdefender, Defender, Kaspersky …)
+  - Unpackt fragt Windows, welcher Scanner aktiv ist, und schreibt es ins Protokoll.
+  - Jede Datei kommt zuerst in eine **Quarantäne** (Arbeitsordner im Ziel).
+  - Jede Datei wird zur Prüfung gelesen – dabei schaut der aktive Echtzeitschutz hinein –,
+    und Unpackt fragt den Scanner zusätzlich direkt über **AMSI** (die Prüf-Schnittstelle von Windows).
+  - Dateien, die der Scanner blockiert oder entfernt, werden **nicht** einsortiert; sie stehen rot
+    im Protokoll und in `Zuordnung.csv` (`pruefung` = `VIRUS`). Aus dem Archiv wird nie etwas gestartet.
+  - Kostet etwas Zeit: 40.000 Dateien brauchten im Test 183 s statt 103 s.
+
 - **ChatGPT-Exporte** werden automatisch erkannt. Die Dateien bekommen ihre echten Namen zurück
   (statt `file_….dat`), und jeder Chat landet als Markdown in `Chats/`,
   mit Links zu den sortierten Dateien.
@@ -263,8 +301,12 @@ python unpackt.py export.7z D:\Sortiert\Export # eigener Ziel-Ordner
 | `--abschnitt N` | Dateien pro Abschnitt vor der Prüfung (Standard 2000) |
 | `--probe` | Probelauf: nur zählen, nichts schreiben (ZIP oder Ordner) |
 | `--hardlink` | harte Links statt Kopien (Ordner als Quelle, gleiches Laufwerk) |
+| `--gross` | auch verdächtig große Archive ohne Nachfrage entpacken (der Platz-Schutz bleibt an) |
 | `--gui` | Fenster öffnen |
 | `--version` | Version anzeigen |
+
+Rückgabe-Codes: `0` fertig · `1` fertig mit Fehlern · `2` konnte nicht starten · `3` abgebrochen ·
+`4` vom Bomben-Schutz angehalten · `5` fertig, aber der Virenscanner hat Dateien blockiert.
 
 ### Ergebnis
 

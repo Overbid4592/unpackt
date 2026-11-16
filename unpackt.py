@@ -80,7 +80,7 @@ try:   # Ziehen & Ablegen (optional: pip install tkinterdnd2)
 except ImportError:
     TkinterDnD = None
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 # ---------------------------------------------------------------- Hilfen
 
@@ -448,7 +448,174 @@ class CountingReader:
         pass
 
 
-def _extract_tar(p: Path, staging: Path, on_frac, check_cancel, say) -> list[str]:
+# ---------------------------------------------------------------- Schutz vor Entpack-Bomben
+
+RESERVE_BYTES = 5 * 1024 ** 3     # so viel bleibt auf der Ziel-Festplatte immer frei
+SUSPICIOUS_RATIO = 100            # ausgepackt größer als 100 × Archiv = verdächtig …
+SUSPICIOUS_MIN = 1024 ** 3        # … aber erst ab 1 GB
+MAX_FILES = 1_000_000             # mehr Dateien = verdächtig
+LIMIT_SLACK = 64 * 1024 ** 2      # Spielraum, wenn das Archiv seine Größe angibt
+DISK_CHECK_BYTES = 128 * 1024 ** 2   # so oft (in Bytes) den freien Platz nachmessen
+
+
+class SchutzStopp(Exception):
+    """Der Bomben-Schutz hat angehalten."""
+
+
+def fmt_bytes(n: float) -> str:
+    """1536 -> '1,5 KB'"""
+    for unit in ("Bytes", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return (f"{n:.0f} {unit}" if unit == "Bytes" else f"{n:.1f} {unit}").replace(".", ",")
+        n /= 1024
+    return f"{n:.1f} TB"
+
+
+def _existing(p: Path) -> Path:
+    """Nächster vorhandener Ordner (für den freien Platz, auch wenn das Ziel noch fehlt)."""
+    p = p.resolve()
+    while not p.exists() and p.parent != p:
+        p = p.parent
+    return p
+
+
+def _bsdtar_sizes(p: Path) -> tuple[int, int] | None:
+    """Ausgepackte Größe und Anzahl Dateien laut 7z/RAR/ISO-Verzeichnis (über tar -tvf)."""
+    tar = find_bsdtar()
+    if not tar:
+        return None
+    r = subprocess.run([tar, "-tvf", str(p)], capture_output=True, **NO_WINDOW)
+    if r.returncode != 0:
+        return None
+    total = files = 0
+    for line in r.stdout.decode("utf-8", errors="replace").splitlines():
+        parts = line.split(None, 8)
+        if len(parts) >= 9 and parts[0].startswith("-") and parts[4].isdigit():
+            total += int(parts[4])
+            files += 1
+    return total, files
+
+
+def estimate_size(kind: str, p: Path) -> tuple[int, int] | None:
+    """Wie groß wird es ausgepackt (Bytes, Dateien)? None = steht nicht im Archiv
+    (z. B. .gz, .tar.gz) – dann passt nur der Wächter beim Auspacken auf."""
+    try:
+        if kind == "zip":
+            with zipfile.ZipFile(p) as z:
+                infos = [i for i in z.infolist() if not i.is_dir()]
+            return sum(i.file_size for i in infos), len(infos)
+        if kind == "bsdtar":
+            return _bsdtar_sizes(p)
+        if kind == "tar":
+            with open(p, "rb") as f:
+                plain = f.read(512)[257:262] == b"ustar"
+            if plain:   # ungepacktes TAR: die Köpfe lesen geht schnell
+                with tarfile.open(p, "r:") as tf:
+                    ms = [m for m in tf.getmembers() if m.isfile()]
+                return sum(m.size for m in ms), len(ms)
+            return None
+        if kind == "folder":
+            total = files = 0
+            for dirpath, _, filenames in os.walk(p):
+                for fn in filenames:
+                    try:
+                        total += os.path.getsize(os.path.join(dirpath, fn))
+                        files += 1
+                    except OSError:
+                        pass
+            return total, files
+    except (OSError, zipfile.BadZipFile, tarfile.TarError):
+        return None
+    return None
+
+
+class Guard:
+    """Passt beim Auspacken auf: nicht mehr Daten als angekündigt, nicht zu viele Dateien,
+    die Festplatte nie ganz voll. Fragt einmal nach (confirm), wenn eine weiche Grenze
+    überschritten wird; harte Grenzen stoppen sofort."""
+
+    def __init__(self, disk: Path, known_total: int | None, archive_size: int,
+                 confirm: Callable[[str], bool] | None, allowed: bool = False):
+        self.disk = _existing(disk)
+        self.confirm = confirm
+        self.allowed = allowed            # schon bestätigt: weiche Grenzen aus
+        self.known = known_total
+        # Hart: angekündigte Größe (+ Spielraum). Weich (nur ohne Angabe): 100 × Archiv, mind. 1 GB
+        self.hard = None if known_total is None else known_total + known_total // 20 + LIMIT_SLACK
+        self.soft = None if known_total is not None else max(archive_size * SUSPICIOUS_RATIO,
+                                                             SUSPICIOUS_MIN)
+        self.written = 0
+        self.files = 0
+        self._next_disk = 0
+
+    def free(self) -> int:
+        return shutil.disk_usage(self.disk).free
+
+    def check_disk(self) -> None:
+        free = self.free()
+        if free < RESERVE_BYTES:
+            raise SchutzStopp(f"Die Festplatte ist fast voll (nur noch {fmt_bytes(free)} frei). "
+                              f"Unpackt lässt immer {fmt_bytes(RESERVE_BYTES)} frei und hat angehalten.")
+
+    def _ask(self, text: str) -> None:
+        if self.allowed:
+            return
+        if self.confirm is not None and self.confirm(text):
+            self.allowed = True
+            return
+        raise SchutzStopp(text + " – nicht bestätigt, deshalb angehalten.")
+
+    def add(self, nbytes: int = 0, nfiles: int = 0) -> None:
+        self.written += nbytes
+        self.files += nfiles
+        if self.hard is not None and self.written > self.hard:
+            raise SchutzStopp(f"Das Archiv erzeugt mehr Daten, als es angibt "
+                              f"({fmt_bytes(self.written)} statt {fmt_bytes(self.known)}). "
+                              f"Das ist typisch für eine Entpack-Bombe.")
+        if self.soft is not None and self.written > self.soft:
+            self.soft = None
+            self._ask(f"Das Archiv wird ausgepackt mindestens {fmt_bytes(self.written)} groß – "
+                      f"viel mehr als üblich. Möglicherweise eine Entpack-Bombe")
+        if self.files > MAX_FILES:
+            self._ask(f"Das Archiv enthält mehr als {num(MAX_FILES)} Dateien")
+            self.files = -10 ** 12   # nur einmal fragen
+        if self.written >= self._next_disk:
+            self._next_disk = self.written + DISK_CHECK_BYTES
+            self.check_disk()
+
+
+def precheck(kind: str, src_path: Path, dst: Path, est: tuple[int, int] | None,
+             confirm: Callable[[str], bool] | None, say) -> bool:
+    """Vor dem Auspacken: reicht der Platz, ist das Archiv verdächtig?
+    Gibt zurück, ob weiche Grenzen schon bestätigt sind. Wirft SchutzStopp."""
+    free = shutil.disk_usage(_existing(dst)).free
+    if est is None:
+        say(f"Ausgepackte Größe steht nicht im Archiv – der Wächter zählt beim Auspacken mit. "
+            f"Frei: {fmt_bytes(free)}")
+        return False
+    total, files = est
+    say(f"Ausgepackt etwa {fmt_bytes(total)} in {num(files)} Dateien · frei: {fmt_bytes(free)}")
+    if total > free - RESERVE_BYTES:
+        raise SchutzStopp(f"Nicht genug Platz: braucht etwa {fmt_bytes(total)}, frei sind "
+                          f"{fmt_bytes(free)} (davon bleiben {fmt_bytes(RESERVE_BYTES)} immer frei).")
+    reasons = []
+    if kind != "folder":
+        packed = max(src_path.stat().st_size, 1)
+        if total > SUSPICIOUS_MIN and total > packed * SUSPICIOUS_RATIO:
+            reasons.append(f"aus {fmt_bytes(packed)} werden {fmt_bytes(total)} "
+                           f"({num(total // packed)}-mal so groß)")
+    if files > MAX_FILES:
+        reasons.append(f"{num(files)} Dateien")
+    if not reasons:
+        return False
+    text = "Verdächtiges Archiv: " + " und ".join(reasons) + ". Das könnte eine Entpack-Bombe sein"
+    if confirm is not None and confirm(text):
+        say("Trotz Warnung bestätigt: " + text, "warn")
+        return True
+    raise SchutzStopp(text + " – nicht bestätigt, deshalb nicht entpackt.")
+
+
+def _extract_tar(p: Path, staging: Path, on_frac, check_cancel, say, guard: Guard) -> list[str]:
     size = max(p.stat().st_size, 1)
     problems, skipped = [], 0
     with open(p, "rb") as raw:
@@ -461,6 +628,7 @@ def _extract_tar(p: Path, staging: Path, on_frac, check_cancel, say) -> list[str
                     if not m.isfile():
                         skipped += 1          # Verknüpfungen, Geräte usw.
                         continue
+                    guard.add(m.size, 1)      # vor dem Schreiben: Größe steht im Kopf
                     try:
                         tf.extract(m, staging, filter="data")   # "data": nichts außerhalb
                     except (tarfile.FilterError, OSError) as e:
@@ -473,16 +641,18 @@ def _extract_tar(p: Path, staging: Path, on_frac, check_cancel, say) -> list[str
     return problems
 
 
-def _extract_single(p: Path, staging: Path, on_frac, check_cancel, say) -> list[str]:
+def _extract_single(p: Path, staging: Path, on_frac, check_cancel, say, guard: Guard) -> list[str]:
     size = max(p.stat().st_size, 1)
     out = staging / safe_name(p.stem or "entpackt")
+    guard.add(0, 1)
     with open(p, "rb") as raw:
         reader = CountingReader(raw, lambda n: (check_cancel(), on_frac(n / size)))
         try:
             with SINGLE[p.suffix.lower()](reader) as f, open(out, "wb") as o:
                 while chunk := f.read(CHUNK):
+                    guard.add(len(chunk))     # vor dem Schreiben zählen
                     o.write(chunk)
-        except Abgebrochen:
+        except (Abgebrochen, SchutzStopp):
             raise
         except Exception as e:
             raise ExtractError(f"Datei lässt sich nicht entpacken: {e}") from e
@@ -494,7 +664,7 @@ def _tar_text(b: bytes) -> str:
     return " | ".join(lines[-3:])
 
 
-def _extract_bsdtar(p: Path, staging: Path, on_frac, check_cancel, say) -> list[str]:
+def _extract_bsdtar(p: Path, staging: Path, on_frac, check_cancel, say, guard: Guard) -> list[str]:
     tar = find_bsdtar()
     if not tar:
         raise ExtractError("Für dieses Format wird bsdtar gebraucht (tar.exe, in Windows 10/11 eingebaut).")
@@ -507,21 +677,42 @@ def _extract_bsdtar(p: Path, staging: Path, on_frac, check_cancel, say) -> list[
     total = max(1, sum(1 for l in lst.stdout.splitlines() if l.strip()))
     proc = subprocess.Popen([tar, "-xvf", str(p), "-C", str(staging)], stdin=subprocess.DEVNULL,
                             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, **NO_WINDOW)
+
+    # tar.exe schreibt selbst – darum misst ein Wächter-Faden laufend den belegten Platz.
+    # So wird auch eine einzelne riesige Datei gestoppt, bei der tar.exe nichts mehr meldet.
+    start_free = guard.free()
+    stop_reason: list[BaseException] = []
+
+    def watch() -> None:
+        while proc.poll() is None:
+            try:
+                check_cancel()
+                used = max(0, start_free - guard.free())
+                guard.add(max(0, used - guard.written))   # nur den Zuwachs melden
+            except (Abgebrochen, SchutzStopp) as e:
+                stop_reason.append(e)
+                proc.kill()
+                return
+            except OSError:
+                pass
+            time.sleep(0.2)
+
+    watcher = threading.Thread(target=watch, daemon=True)
+    watcher.start()
     problems, count = [], 0
-    try:
-        for line in proc.stderr:
-            check_cancel()
-            text = line.decode("utf-8", errors="replace").rstrip()
-            if text.startswith("x "):
-                count += 1
-                on_frac(min(count / total, 1.0))
-            elif text:
-                problems.append(text)
-    except Abgebrochen:
-        proc.kill()
-        proc.wait()
-        raise
+    for line in proc.stderr:
+        text = line.decode("utf-8", errors="replace").rstrip()
+        if text.startswith("x "):
+            count += 1
+            on_frac(min(count / total, 1.0))
+        elif text:
+            problems.append(text)
     proc.wait()
+    watcher.join()
+    if stop_reason:
+        raise stop_reason[0]
+    # Schlussmessung: falls tar.exe schneller fertig war, als der Wächter nachsehen konnte
+    guard.add(max(0, (start_free - guard.free()) - guard.written))
     if proc.returncode != 0:
         msg = " | ".join(problems[-3:]) or f"tar.exe Fehlercode {proc.returncode}"
         if "assphrase" in msg or "ncrypt" in msg:
@@ -590,6 +781,141 @@ def check_file(target: Path, size: int, crc: int | None, sha: str | None) -> str
     except OSError as e:
         return f"Datei nicht lesbar: {e}"
     return None
+
+
+# ---------------------------------------------------------------- Virenscanner (jeder, über Windows)
+#
+# Unpackt bringt keinen eigenen Virenscanner mit, sondern nutzt den, der auf dem PC läuft
+# (Bitdefender, Defender, Kaspersky, Avira …):
+#   1. Windows (Security Center) sagt, welcher Scanner aktiv ist – das steht im Protokoll.
+#   2. Jede Datei kommt erst in die Quarantäne (Arbeitsordner im Ziel).
+#   3. Beim Prüfen wird jede Datei gelesen; dabei schaut der Echtzeitschutz hinein.
+#      Zusätzlich fragt Unpackt den Scanner direkt über AMSI (die Prüf-Schnittstelle von Windows).
+#   4. Blockiert oder entfernt der Scanner eine Datei, wird sie NICHT einsortiert.
+# Dateien aus dem Archiv werden dabei nie geöffnet oder gestartet – nur gelesen.
+
+AMSI_MAX = 64 * 1024 ** 2    # bis zu dieser Größe wird der Scanner direkt (AMSI) gefragt
+VIRUS_MARK = "🦠"            # Kennzeichen in Fehlertexten: vermutlich der Virenscanner
+
+
+@lru_cache(maxsize=1)
+def antivirus_products() -> tuple[tuple[str, bool], ...]:
+    """Virenscanner, die Windows kennt: (Name, Echtzeitschutz an?). Leer außerhalb von Windows."""
+    if sys.platform != "win32":
+        return ()
+    ps = ("[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false; "
+          "Get-CimInstance -Namespace root/SecurityCenter2 -ClassName AntiVirusProduct | "
+          "ForEach-Object { \"$($_.displayName)|$($_.productState)\" }")
+    # PSModulePath von PowerShell 7 würde Windows PowerShell fremde Module laden lassen
+    env = {k: v for k, v in os.environ.items() if k.upper() != "PSMODULEPATH"}
+    try:
+        r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+                           capture_output=True, timeout=30, env=env, **NO_WINDOW)
+    except (OSError, subprocess.SubprocessError):
+        return ()
+    out = []
+    for line in r.stdout.decode("utf-8", errors="replace").splitlines():
+        name, _, state = line.strip().rpartition("|")
+        if name and state.isdigit():
+            out.append((name, ((int(state) >> 8) & 0xFF) in (0x10, 0x11)))
+    return tuple(out)
+
+
+class Amsi:
+    """Direkte Frage an den aktiven Virenscanner über AMSI (nur Windows)."""
+
+    def __init__(self) -> None:
+        self.ok = False
+        if sys.platform != "win32":
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+            dll = ctypes.WinDLL("amsi.dll")
+            H = wintypes.HANDLE
+            dll.AmsiInitialize.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(H)]
+            dll.AmsiInitialize.restype = ctypes.HRESULT
+            dll.AmsiOpenSession.argtypes = [H, ctypes.POINTER(H)]
+            dll.AmsiOpenSession.restype = ctypes.HRESULT
+            dll.AmsiScanBuffer.argtypes = [H, ctypes.c_void_p, ctypes.c_ulong, wintypes.LPCWSTR, H,
+                                           ctypes.POINTER(ctypes.c_int)]
+            dll.AmsiScanBuffer.restype = ctypes.HRESULT
+            dll.AmsiCloseSession.argtypes = [H, H]
+            dll.AmsiCloseSession.restype = None
+            dll.AmsiUninitialize.argtypes = [H]
+            dll.AmsiUninitialize.restype = None
+            ctx, ses = H(), H()
+            if dll.AmsiInitialize("Unpackt", ctypes.byref(ctx)) != 0:
+                return
+            if dll.AmsiOpenSession(ctx, ctypes.byref(ses)) != 0:
+                dll.AmsiUninitialize(ctx)
+                return
+        except (OSError, AttributeError):
+            return
+        self._ct, self.dll, self.ctx, self.ses = ctypes, dll, ctx, ses
+        self.ok = True
+
+    def scan(self, data: bytes, name: str) -> bool | None:
+        """True = der Scanner meldet etwas, False = sauber, None = konnte nicht fragen."""
+        if not self.ok:
+            return None
+        ct = self._ct
+        buf = ct.create_string_buffer(data, len(data))
+        res = ct.c_int(0)
+        if self.dll.AmsiScanBuffer(self.ctx, buf, len(data), name, self.ses, ct.byref(res)) != 0:
+            return None
+        # 32768 und mehr = erkannt; 16384–20479 = vom Administrator gesperrt
+        return res.value >= 32768 or 16384 <= res.value <= 20479
+
+    def close(self) -> None:
+        if self.ok:
+            self.ok = False
+            self.dll.AmsiCloseSession(self.ctx, self.ses)
+            self.dll.AmsiUninitialize(self.ctx)
+
+
+def _av_reason(e: OSError, ours: bool) -> str | None:
+    """Sieht der Fehler nach einem Eingriff des Virenscanners aus? ours = Datei liegt in
+    unserer Quarantäne (dort löscht oder sperrt sonst niemand)."""
+    if getattr(e, "winerror", None) in (225, 226):   # ERROR_VIRUS_INFECTED / _DELETED
+        return "vom Virenscanner blockiert"
+    if isinstance(e, PermissionError):
+        return "Zugriff verweigert – vermutlich vom Virenscanner blockiert"
+    if ours and isinstance(e, FileNotFoundError):
+        return "Datei ist verschwunden – vermutlich vom Virenscanner in Quarantäne genommen"
+    return None
+
+
+def check_quarantine(qpath: Path, expect, amsi: Amsi | None, label: str,
+                     av_name: str = "") -> tuple[str | None, bool]:
+    """Prüft eine Datei in der Quarantäne: Virenscanner, Größe, CRC32, SHA-256.
+    Rückgabe: (Problem oder None, ist es ein Fund des Virenscanners?)."""
+    if isinstance(expect, str):
+        if expect.startswith(VIRUS_MARK):
+            return expect[len(VIRUS_MARK):] + av_name, True
+        return expect, False
+    size, crc, sha = expect
+    try:
+        real = qpath.stat().st_size
+        if real != size:
+            return f"Größe falsch ({real} statt {size} Bytes)", False
+        if amsi is not None and amsi.ok and size <= AMSI_MAX:
+            data = qpath.read_bytes()
+            if amsi.scan(data, label):
+                return f"vom Virenscanner gemeldet{av_name} (AMSI)", True
+            real_crc, real_sha = zlib.crc32(data), hashlib.sha256(data).hexdigest()
+        elif crc is None and sha is None:
+            return None, False
+        else:
+            real_crc, real_sha = file_hashes(qpath)
+        if crc is not None and real_crc != crc:
+            return "Prüfsumme (CRC32) stimmt nicht", False
+        if sha is not None and real_sha != sha:
+            return "SHA-256 stimmt nicht", False
+    except OSError as e:
+        r = _av_reason(e, ours=True)
+        return (r + av_name, True) if r else (f"Datei nicht lesbar: {e}", False)
+    return None, False
 
 
 # ---------------------------------------------------------------- Laden (ChatGPT-Export)
@@ -785,13 +1111,17 @@ class Progress:
 
 def run(src_path: Path, dst: Path, hardlink: bool = False, probe: bool = False,
         batch: int = BATCH, log: Callable[[str, str], None] | None = None,
-        progress: Callable[[int, int, str], None] | None = None, cancel=None) -> int:
+        progress: Callable[[int, int, str], None] | None = None, cancel=None,
+        confirm: Callable[[str], bool] | None = None) -> int:
     """Entpackt und sortiert.
 
-    Rückgabe: 0 = fertig, 1 = fertig mit Fehlern, 2 = konnte nicht starten, 3 = abgebrochen.
+    Rückgabe: 0 = fertig, 1 = fertig mit Fehlern, 2 = konnte nicht starten, 3 = abgebrochen,
+    4 = vom Bomben-Schutz angehalten, 5 = fertig, aber der Virenscanner hat Dateien blockiert.
     log(text, art): art ist "info", "head", "ok", "warn" oder "error".
     progress(erledigt, gesamt, text) wird laufend aufgerufen.
     cancel: ein threading.Event; ist es gesetzt, wird sauber abgebrochen.
+    confirm(frage) -> bool: fragt bei einem verdächtigen Archiv nach. Fehlt es,
+    wird bei Verdacht angehalten (sicherer Standard).
     """
     lines: list[str] = []
     out = log or _print_log
@@ -803,10 +1133,13 @@ def run(src_path: Path, dst: Path, hardlink: bool = False, probe: bool = False,
     state = {"started": False, "staging": None, "close": []}
     try:
         return _run(src_path, dst, hardlink, probe, max(1, batch), say,
-                    progress or (lambda *a: None), cancel, state)
+                    progress or (lambda *a: None), cancel, state, confirm)
     except Abgebrochen:
         say("Abgebrochen. Was schon einsortiert ist, bleibt im Ziel-Ordner.", "warn")
         return 3
+    except SchutzStopp as e:
+        say(f"🛡 Schutz: {e}", "error")
+        return 4
     except ExtractError as e:
         say(f"Auspacken fehlgeschlagen: {e}", "error")
         return 2
@@ -843,51 +1176,51 @@ def _remove_tree(p: Path) -> None:
     shutil.rmtree(p, onexc=retry)
 
 
-def _copy_one(src, name: str, target: Path, created: float | None, hardlink: bool):
-    """Sortiert eine Datei ein. Gibt (Größe, CRC32, SHA-256) für die Prüfung zurück
-    oder einen Fehlertext."""
+def _copy_one(src, name: str, qpath: Path, hardlink: bool):
+    """Holt eine Datei in die Quarantäne (qpath). Gibt (Größe, CRC32, SHA-256) für die Prüfung
+    zurück oder einen Fehlertext (mit VIRUS_MARK vorne, wenn wohl der Virenscanner eingriff)."""
     try:
-        target.parent.mkdir(parents=True, exist_ok=True)
         if src.movable:
-            # Unser Arbeitsordner: erst Prüfsummen nehmen, dann verschieben (kein Platzbedarf)
+            # liegt schon in unserem Arbeitsordner = Quarantäne: nur Prüfsummen nehmen
             p = src.path(name)
             size = p.stat().st_size
             crc, sha = file_hashes(p)
-            os.replace(p, target)
-            _make_writable(target)
-            if created:
-                os.utime(target, (created, created))
             return size, crc, sha
+        qpath.parent.mkdir(parents=True, exist_ok=True)
         if hardlink:
             try:
-                if target.exists():
-                    target.unlink()
-                os.link(src.path(name), target)
+                if qpath.exists():
+                    qpath.unlink()
+                os.link(src.path(name), qpath)
                 return src.size(name), None, None   # gleiche Datei: nur Größe prüfen
             except OSError:
                 pass                                # z. B. anderes Laufwerk -> kopieren
         with src.open(name) as f:
-            _, crc, sha = copy_with_hash(f, target)
-        t = created or src.mtime(name)
-        if t:
-            os.utime(target, (t, t))
+            _, crc, sha = copy_with_hash(f, qpath)
         # Bei einer ZIP zählt die CRC32 aus der ZIP, sonst die beim Lesen berechnete.
         # Die SHA-256 wird beim Lesen der Quelle berechnet (eine ZIP prüft dabei
         # selbst ihre CRC32, also stimmt auch die Quelle).
         want = src.crc(name)
         return src.size(name), (crc if want is None else want), sha
-    except (OSError, zipfile.BadZipFile, EOFError, NotImplementedError, RuntimeError) as e:
+    except OSError as e:
+        r = _av_reason(e, ours=src.movable)
+        return (VIRUS_MARK + r) if r else f"Kopieren fehlgeschlagen: {e}"
+    except (zipfile.BadZipFile, EOFError, NotImplementedError, RuntimeError) as e:
         return f"Kopieren fehlgeschlagen: {e}"
 
 
-def _check_one(target: Path, expect) -> str | None:
-    if isinstance(expect, str):
-        return expect
-    return check_file(target, *expect)
+def _release(src, name: str, qpath: Path, target: Path, created: float | None) -> None:
+    """Geprüfte Datei aus der Quarantäne an ihren Platz im sortierten Ordner."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    os.replace(qpath, target)
+    _make_writable(target)
+    t = created or (None if src.movable else src.mtime(name))
+    if t:
+        os.utime(target, (t, t))
 
 
 def _run(src_path: Path, dst: Path, hardlink: bool, probe: bool, batch: int,
-         say, tick, cancel, state) -> int:
+         say, tick, cancel, state, confirm=None) -> int:
     def check_cancel() -> None:
         if cancel is not None and cancel.is_set():
             raise Abgebrochen
@@ -931,6 +1264,32 @@ def _run(src_path: Path, dst: Path, hardlink: bool, probe: bool, batch: int,
     say(f"Quelle: {src_path}", "head")
     say(f"Erkannt: {KIND_TEXT[kind]}")
 
+    # ---- Bomben-Schutz: vorher schätzen, Platz und Verdacht prüfen
+    est = estimate_size(kind, src_path)
+    if probe:
+        if est:
+            say(f"Ausgepackt etwa {fmt_bytes(est[0])} in {num(est[1])} Dateien")
+        allowed = True
+    else:
+        allowed = precheck(kind, src_path, dst, est, confirm, say)
+    packed = src_path.stat().st_size if kind != "folder" else 0
+    guard = Guard(dst, est[0] if est else None, packed, confirm, allowed)
+
+    # ---- Virenscanner: welcher läuft? (jeder, den Windows kennt)
+    amsi, av_active, av_label = None, False, ""
+    if not probe:
+        active = [name for name, on in antivirus_products() if on]
+        av_active = bool(active)
+        amsi = Amsi()
+        state["close"].append(amsi.close)
+        if active:
+            av_label = f" ({', '.join(active)})"
+            say(f"🛡 Virenscanner: {', '.join(active)} – prüft jede Datei in der Quarantäne"
+                + (", auch direkt über AMSI" if amsi.ok else ""), "ok")
+        elif sys.platform == "win32":
+            say("⚠ Kein aktiver Virenscanner gefunden – die Dateien werden NICHT auf Viren geprüft.",
+                "warn")
+
     # ---- 1. SHA-256 vorher
     sha_before = ""
     if hashing:
@@ -951,7 +1310,7 @@ def _run(src_path: Path, dst: Path, hardlink: bool, probe: bool, batch: int,
         problems += EXTRACTORS[kind](
             src_path, staging,
             lambda f: prog.set("extract", f, f"Auspacken · {int(f * 100)} %"),
-            check_cancel, say)
+            check_cancel, say, guard)
         prog.done("extract")
         say("Auspacken fertig.", "ok")
         src = FolderSource(staging, movable=True)
@@ -1054,55 +1413,80 @@ def _run(src_path: Path, dst: Path, hardlink: bool, probe: bool, batch: int,
             links_by_conv[cid][fid] = link
 
     # ---- 3. Einsortieren und prüfen, Abschnitt für Abschnitt
+    #      (erst in die Quarantäne, dann prüfen – Virenscanner, Größe, CRC32, SHA-256 –,
+    #       erst dann in den sortierten Ordner)
     n = len(plan)
-    status, shas, errors = [""] * n, [""] * n, []
-    verb = "sortiere ein" if src.movable else "kopiere"
+    status, shas, errors, viruses = [""] * n, [""] * n, [], []
+    verb = "prüfe in der Quarantäne" if src.movable else "kopiere in die Quarantäne"
     if probe:
         say("Probelauf: es wird nichts geschrieben.", "warn")
     else:
         state["started"] = True
         dst.mkdir(parents=True, exist_ok=True)
+        staging = dst / STAGING
+        staging.mkdir(exist_ok=True)
+        state["staging"] = staging
+        quarantine = staging / "quarantaene"
+        checks = "Virenscanner, Größe, CRC32, SHA-256" if av_active else "Größe, CRC32, SHA-256"
         steps = 0
         sections = (n + batch - 1) // batch
         for k in range(sections):
             a, b = k * batch, min(n, (k + 1) * batch)
             label = f"Abschnitt {k + 1}/{sections}"
-            say(f"{label}: Dateien {num(a + 1)}–{num(b)} einsortieren …", "head")
-            expect = {}
+            say(f"{label}: Dateien {num(a + 1)}–{num(b)} in die Quarantäne …", "head")
+            expect, qpaths = {}, {}
             for i in range(a, b):
                 check_cancel()
                 rel, target, created = plan[i]
-                expect[i] = _copy_one(src, rel, target, created, hardlink)
+                qpaths[i] = src.path(rel) if src.movable else quarantine / f"{i:07d}"
+                if not src.movable and not hardlink:
+                    guard.add(src.size(rel), 1)   # Kopie braucht neuen Platz: vorher prüfen
+                expect[i] = _copy_one(src, rel, qpaths[i], hardlink)
                 steps += 1
-                prog.set("files", steps / (2 * n), f"{label} · {verb} Datei {num(i + 1)} von {num(n)}")
+                prog.set("files", steps / (2 * n), f"{label} · {verb}: Datei {num(i + 1)} von {num(n)}")
 
-            say(f"{label}: prüfe {num(b - a)} Dateien (Größe, CRC32, SHA-256) …")
-            bad = 0
+            if av_active:
+                time.sleep(0.5)   # dem Echtzeitschutz einen Augenblick geben
+            say(f"{label}: prüfe {num(b - a)} Dateien ({checks}) …")
+            bad = found = 0
             for i in range(a, b):
                 check_cancel()
                 rel, target, created = plan[i]
-                problem = _check_one(target, expect[i])
-                if problem:
+                problem, virus = check_quarantine(qpaths[i], expect[i], amsi, rel, av_label)
+                retried = False
+                if problem and not virus and not src.movable:
                     say(f"{rel}: {problem} – noch ein Versuch …", "warn")
-                    expect[i] = _copy_one(src, rel, target, created, hardlink)
-                    problem = _check_one(target, expect[i])
-                    if problem:
-                        bad += 1
-                        status[i] = f"FEHLER: {problem}"
-                        errors.append(rel)
-                        say(f"{rel} → {target.relative_to(dst)}: {problem}", "error")
-                    else:
-                        status[i] = "ok (2. Versuch)"
-                        say(f"{rel}: beim 2. Versuch in Ordnung", "ok")
-                else:
-                    status[i] = "ok"
+                    expect[i] = _copy_one(src, rel, qpaths[i], hardlink)
+                    problem, virus = check_quarantine(qpaths[i], expect[i], amsi, rel, av_label)
+                    retried = True
                 if not problem:
+                    try:
+                        _release(src, rel, qpaths[i], target, created)
+                    except OSError as e:
+                        r = _av_reason(e, ours=True)
+                        problem, virus = ((r + av_label, True) if r
+                                          else (f"Einsortieren fehlgeschlagen: {e}", False))
+                if virus:
+                    found += 1
+                    status[i] = f"VIRUS: {problem}"
+                    viruses.append(rel)
+                    say(f"🦠 {rel}: {problem} – NICHT einsortiert", "error")
+                elif problem:
+                    bad += 1
+                    status[i] = f"FEHLER: {problem}"
+                    errors.append(rel)
+                    say(f"{rel} → {target.relative_to(dst)}: {problem}", "error")
+                else:
+                    status[i] = "ok (2. Versuch)" if retried else "ok"
                     shas[i] = expect[i][2] or ""
+                    if retried:
+                        say(f"{rel}: beim 2. Versuch in Ordnung", "ok")
                 steps += 1
                 prog.set("files", steps / (2 * n), f"{label} · prüfe Datei {num(i + 1)} von {num(n)}")
-            if bad:
-                say(f"{label}: {num(b - a - bad)} von {num(b - a)} in Ordnung, {num(bad)} Fehler",
-                    "error")
+            if bad or found:
+                say(f"{label}: {num(b - a - bad - found)} von {num(b - a)} in Ordnung"
+                    + (f", {num(bad)} Fehler" if bad else "")
+                    + (f", 🦠 {num(found)} vom Virenscanner blockiert" if found else ""), "error")
             else:
                 say(f"{label}: alle {num(b - a)} Dateien geprüft ✓", "ok")
     prog.done("files")
@@ -1137,7 +1521,8 @@ def _run(src_path: Path, dst: Path, hardlink: bool, probe: bool, batch: int,
     prog.done("chats")
 
     # ---- Übersicht und Zuordnung
-    cat_count = Counter(r[3] for r in rows)
+    # gezählt wird, was wirklich im sortierten Ordner liegt (beim Probelauf: der Plan)
+    cat_count = Counter(r[3] for r, st in zip(rows, status) if probe or st.startswith("ok"))
     cats_sorted = sorted(cat_count.items(), key=lambda kv: (-kv[1], kv[0]))
     if not probe:
         ov = [f"# Übersicht: {src_path.name}", "",
@@ -1176,19 +1561,30 @@ def _run(src_path: Path, dst: Path, hardlink: bool, probe: bool, batch: int,
             f"{sha_before} *{src_path.name}\n", encoding="utf-8")
 
     # ---- Zusammenfassung
-    say(f"Fertig: {num(n)} Dateien in {num(len(cat_count))} Ordnern"
+    placed = sum(cat_count.values())
+    say(f"Fertig: {num(placed)} Dateien in {num(len(cat_count))} Ordnern"
         + (f", {num(len(conv_by_id))} Chats" if chatgpt else "") + ".", "ok")
     if cats_sorted:
         say(" · ".join(f"{c} {num(k)}" for c, k in cats_sorted))
     if not probe:
         if errors:
-            say(f"Prüfung: {num(n - len(errors))} in Ordnung, {num(len(errors))} mit Fehler "
-                f"(siehe Zuordnung.csv, Spalte pruefung).", "error")
-        else:
+            say(f"Prüfung: {num(n - len(errors) - len(viruses))} in Ordnung, {num(len(errors))} mit "
+                f"Fehler (siehe Zuordnung.csv, Spalte pruefung).", "error")
+        elif not viruses:
             say(f"Prüfung: alle {num(n)} Dateien in Ordnung ✓", "ok")
+        if viruses:
+            say(f"🦠 Der Virenscanner{av_label} hat {num(len(viruses))} Datei(en) blockiert. Sie wurden "
+                f"NICHT einsortiert und mit der Quarantäne gelöscht (Unpackt verändert das Archiv nicht). "
+                f"Liste: Zuordnung.csv, Spalte pruefung = VIRUS.", "error")
+            for rel in viruses[:10]:
+                say(f"   🦠 {rel}", "error")
+            if len(viruses) > 10:
+                say(f"   … und {num(len(viruses) - 10)} weitere", "error")
     if problems:
         say(f"Beim Auspacken gab es {num(len(problems))} Probleme (siehe oben).", "error")
     say(f"Ziel: {dst}")
+    if viruses:
+        return 5
     return 1 if errors or problems or not zip_ok else 0
 
 
@@ -1212,6 +1608,8 @@ DONE_TEXT = {
     1: ("Fertig – aber mit Fehlern. Bitte ins Protokoll schauen.", "error"),
     2: ("Konnte nicht starten. Bitte ins Protokoll schauen.", "error"),
     3: ("Abgebrochen.", "warn"),
+    4: ("🛡 Vom Schutz angehalten – siehe Protokoll.", "error"),
+    5: ("🦠 Fertig – der Virenscanner hat Dateien blockiert. Siehe Protokoll.", "error"),
 }
 
 
@@ -1488,13 +1886,24 @@ class App:
             code = run(src, dst,
                             log=lambda m, lvl: self.q.put(("log", m, lvl)),
                             progress=lambda d, t, s: self.q.put(("prog", d, t, s)),
-                            cancel=self.cancel)
+                            cancel=self.cancel, confirm=self._confirm)
         except Exception as e:
             self.q.put(("log", f"Unerwarteter Fehler: {e!r}", "error"))
             for line in traceback.format_exc().rstrip().splitlines():
                 self.q.put(("log", line, "error"))
             code = 2
         self.q.put(("done", code))
+
+    def _confirm(self, text: str) -> bool:
+        """Bomben-Schutz fragt nach. Läuft im Hintergrund-Faden: die Frage stellt das Fenster,
+        hier wird auf die Antwort gewartet."""
+        answer = {"ok": False}
+        done = threading.Event()
+        self.q.put(("ask", text, answer, done))
+        while not done.wait(0.2):
+            if self.cancel.is_set():
+                return False
+        return answer["ok"]
 
     def poll(self) -> None:
         last = None
@@ -1505,6 +1914,14 @@ class App:
                     self.write(item[1], item[2])
                 elif item[0] == "prog":
                     last = item          # nur den neuesten Stand anzeigen
+                elif item[0] == "ask":
+                    _, text, answer, done = item
+                    self.write("🛡 " + text, "warn")
+                    answer["ok"] = (not self.closing) and messagebox.askyesno(
+                        "Unpackt – Schutz",
+                        text.rstrip(".?") + ".\n\nTrotzdem entpacken? (Nur wenn du dem Archiv vertraust.)",
+                        icon="warning", default="no")
+                    done.set()
                 elif item[0] == "done":
                     if last:
                         self._show_progress(*last[1:])
@@ -1530,7 +1947,7 @@ class App:
         text, level = DONE_TEXT.get(code, (f"Beendet (Code {code}).", "warn"))
         self.status_var.set(text)
         self.root.title(f"{APP_TITLE} – {APP_TAGLINE}")
-        if code in (0, 1):
+        if code in (0, 1, 5):
             self.bar.configure(value=self.bar.cget("maximum"))
             self.pct_var.set("100 %")
         self.btn_cancel.configure(state="disabled")
@@ -1611,13 +2028,21 @@ def main() -> int:
     ap.add_argument("--hardlink", action="store_true",
                     help="Harte Links statt Kopien (spart Platz, nur bei Ordner und gleichem Laufwerk)")
     ap.add_argument("--probe", action="store_true", help="Nur zählen, nichts schreiben")
+    ap.add_argument("--gross", action="store_true",
+                    help="Auch verdächtig große Archive entpacken (Bomben-Schutz fragt dann nicht; "
+                         "der Platz-Schutz bleibt)")
     ap.add_argument("--version", action="version", version=f"Unpackt {__version__}")
     a = ap.parse_args()
     # Ohne Konsole (Unpackt.exe, pythonw, Archiv auf die EXE gezogen): immer das Fenster
     if a.gui or a.quelle is None or sys.stdout is None:
         return gui_main(a.quelle)
     dst = a.ziel or default_target(a.quelle)
-    return run(a.quelle, dst, a.hardlink, a.probe, a.abschnitt)
+    code = run(a.quelle, dst, a.hardlink, a.probe, a.abschnitt,
+               confirm=(lambda text: True) if a.gross else None)
+    if code == 4 and not a.gross:
+        print("Tipp: Wenn du dem Archiv vertraust, mit --gross noch einmal starten "
+              "(der Platz-Schutz bleibt trotzdem an).")
+    return code
 
 
 if __name__ == "__main__":

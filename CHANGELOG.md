@@ -6,6 +6,47 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 Alle wichtigen Änderungen an Unpackt stehen hier (Deutsch jeweils darunter).
 
+## [1.1.0] – 2026-11-16
+
+Protection against decompression bombs and a virus scanner layer. /
+Schutz vor Entpack-Bomben und eine Virenscanner-Schicht.
+
+### Added
+
+- Virus scanner layer that works with any scanner Windows knows (tested with Bitdefender):
+  the active scanner is shown in the log; every file goes into a quarantine first, is read for
+  the check (real-time protection) and scanned via AMSI; blocked or removed files are not sorted
+  in and are marked `VIRUS` in `Zuordnung.csv`. New exit code `5`. Tested with the harmless
+  EICAR test file in ZIP, TAR.GZ and 7z.
+
+- Before unpacking: estimate of the unpacked size (ZIP, 7z/RAR/ISO via `bsdtar`, plain TAR, folders)
+  and a check of the free disk space – 5 GB always stay free.
+- Suspicious archives (more than 100× bigger than the archive and over 1 GB, or more than
+  1,000,000 files): the window asks first ("No" is the default); the command line stops unless
+  `--gross` is given.
+- While unpacking: a guard counts the bytes really written. Archives that lie about their size
+  are stopped; for formats without size information (`.gz`, `.tar.gz` …) it asks once the
+  content gets suspiciously big. A guard thread watches `tar.exe` too, so even a single huge file is stopped.
+- New exit code `4` = stopped by the bomb protection.
+
+### Hinzugefügt
+
+- Virenscanner-Schicht für jeden Scanner, den Windows kennt (getestet mit Bitdefender): Der aktive
+  Scanner steht im Protokoll; jede Datei kommt zuerst in eine Quarantäne, wird zur Prüfung gelesen
+  (Echtzeitschutz) und über AMSI geprüft; blockierte oder entfernte Dateien werden nicht einsortiert
+  und in `Zuordnung.csv` als `VIRUS` markiert. Neuer Rückgabe-Code `5`. Getestet mit der harmlosen
+  EICAR-Testdatei in ZIP, TAR.GZ und 7z.
+- Vor dem Auspacken: Schätzung der ausgepackten Größe (ZIP, 7z/RAR/ISO über `bsdtar`, ungepacktes
+  TAR, Ordner) und Prüfung des freien Platzes – 5 GB bleiben immer frei.
+- Verdächtige Archive (mehr als 100-mal größer als das Archiv und über 1 GB, oder mehr als
+  1.000.000 Dateien): Das Fenster fragt nach („Nein“ ist vorausgewählt); die Kommandozeile hält an,
+  außer mit `--gross`.
+- Während des Auspackens: Ein Wächter zählt die wirklich geschriebenen Bytes. Archive, die über
+  ihre Größe lügen, werden gestoppt; bei Formaten ohne Größenangabe (`.gz`, `.tar.gz` …) fragt er,
+  sobald der Inhalt verdächtig groß wird. Ein Wächter-Faden passt auch auf `tar.exe` auf, so wird
+  selbst eine einzelne riesige Datei gestoppt.
+- Neuer Rückgabe-Code `4` = vom Bomben-Schutz angehalten.
+
 ## [1.0.0] – 2026-11-16
 
 First public release. / Erste öffentliche Version.
@@ -50,4 +91,5 @@ First public release. / Erste öffentliche Version.
 - Eigenes Icon (Fenster, Taskleiste, EXE) und `Unpackt.exe` für Windows ohne Python
   (mit PyInstaller gebaut, mit selbst erstelltem Zertifikat signiert, unter Releases zu finden).
 
+[1.1.0]: #110--2026-11-16
 [1.0.0]: #100--2026-11-16
