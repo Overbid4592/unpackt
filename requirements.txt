@@ -1,0 +1,3 @@
+# Optional: drag & drop into the window (tested with 0.7.0)
+# Optional: Ziehen & Ablegen ins Fenster (getestet mit 0.7.0)
+tkinterdnd2>=0.7.0
