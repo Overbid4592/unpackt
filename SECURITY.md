@@ -1,4 +1,3 @@
-[SECURITY.md](https://github.com/user-attachments/files/34920217/SECURITY.md)
 # Security Policy
 
 [English](#english) · [Deutsch](#deutsch)
